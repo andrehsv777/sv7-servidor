@@ -243,13 +243,3 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(PORT, () => console.log(`SV7 API rodando na porta ${PORT}`));
-
-{
-  "name": "sv7-server",
-  "version": "1.0.0",
-  "description": "API do sistema SV7 (sem dependências externas)",
-  "main": "server.js",
-  "scripts": {
-    "start": "node server.js"
-  }
-}
