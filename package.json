@@ -1,0 +1,9 @@
+{
+  "name": "sv7-server",
+  "version": "1.0.0",
+  "description": "API do sistema SV7 (sem dependências externas)",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  }
+}
