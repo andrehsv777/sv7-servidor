@@ -1,3 +1,13 @@
+{
+  "name": "sv7-server",
+  "version": "1.0.0",
+  "description": "API do sistema SV7 (sem dependências externas)",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  }
+}
+
 /* ============================================================
    SV7 — Servidor da API
    Escrito em Node.js puro (sem Express/libs externas) para
@@ -216,9 +226,11 @@ const server = http.createServer(async (req, res) => {
       let list = db.locations;
       const driver = url.searchParams.get('driver');
       const since = url.searchParams.get('since'); // ISO timestamp
+      const until = url.searchParams.get('until'); // ISO timestamp
       if (driver) list = list.filter((l) => l.driver === driver);
-      if (since) list = list.filter((l) => l.timestamp > since);
-      return sendJSON(res, 200, list.slice(-2000));
+      if (since) list = list.filter((l) => l.timestamp >= since);
+      if (until) list = list.filter((l) => l.timestamp <= until);
+      return sendJSON(res, 200, list.slice(-8000));
     }
 
     /* ---------- Arquivos estáticos do painel admin (opcional, se hospedado junto) ---------- */
