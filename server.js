@@ -1,54 +1,91 @@
 /* ============================================================
-   SV7 — Servidor da API
-   Escrito em Node.js puro (sem Express/libs externas) para
-   rodar em qualquer hospedagem só com `node server.js`.
-   Banco de dados: arquivo JSON local (db.json). Para uso em
-   produção com muitos motoristas, migrar para Postgres/Mongo —
-   a estrutura das funções abaixo (load/save) facilita a troca.
+   SV7 — Servidor da API (versão com banco de dados permanente)
+   Usa PostgreSQL (ex: Neon, gratuito) em vez de arquivo local —
+   assim os dados NUNCA se perdem quando o servidor reinicia ou
+   quando você atualiza o código. Só some se você apagar.
    ============================================================ */
 
 const http = require('http');
-const fs = require('fs');
-const path = require('path');
 const crypto = require('crypto');
+const { Pool } = require('pg');
 
 const PORT = process.env.PORT || 3000;
-const DB_FILE = path.join(__dirname, 'db.json');
 const ADMIN_USER = 'ADM01';
 const ADMIN_PASS = '2211';
 
-/* ---------------- Banco de dados em arquivo ---------------- */
-function load() {
-  if (!fs.existsSync(DB_FILE)) {
-    const initial = {
-      drivers: [
-        { name: 'João Silva', password: '1234' },
-        { name: 'Carlos Souza', password: '1234' },
-      ],
-      trucks: [
-        { tag: 'SV7-001' }, { tag: 'SV7-002' }, { tag: 'SV7-003' },
-      ],
-      config: { speedLimit: 80, toleranceKmh: 5, overspeedSeconds: 5 },
-      trips: [],       // relatórios de viagens finalizadas
-      locations: [],   // histórico de pontos de GPS (para desenhar rota)
-      status: {},       // status ao vivo por motorista: { [driverName]: {...} }
-    };
-    fs.writeFileSync(DB_FILE, JSON.stringify(initial, null, 2));
-    return initial;
-  }
-  return JSON.parse(fs.readFileSync(DB_FILE, 'utf8'));
+if (!process.env.DATABASE_URL) {
+  console.error('ERRO: variável de ambiente DATABASE_URL não configurada. Configure a connection string do Postgres (ex: Neon) nas variáveis de ambiente do Render.');
 }
-function save(db) {
-  fs.writeFileSync(DB_FILE, JSON.stringify(db, null, 2));
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false },
+});
+
+/* ---------------- Criação das tabelas (só roda se não existirem) ---------------- */
+async function initDB() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS drivers (
+      name TEXT PRIMARY KEY,
+      password TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS trucks (
+      tag TEXT PRIMARY KEY
+    );
+    CREATE TABLE IF NOT EXISTS config (
+      id INT PRIMARY KEY DEFAULT 1,
+      speed_limit INT NOT NULL DEFAULT 80,
+      tolerance_kmh INT NOT NULL DEFAULT 5,
+      overspeed_seconds INT NOT NULL DEFAULT 5
+    );
+    CREATE TABLE IF NOT EXISTS trips (
+      id TEXT PRIMARY KEY,
+      driver TEXT NOT NULL,
+      tag TEXT,
+      start_time TIMESTAMPTZ,
+      end_time TIMESTAMPTZ,
+      data JSONB NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS locations (
+      id BIGSERIAL PRIMARY KEY,
+      driver TEXT NOT NULL,
+      tag TEXT,
+      lat DOUBLE PRECISION,
+      lng DOUBLE PRECISION,
+      speed DOUBLE PRECISION,
+      "timestamp" TIMESTAMPTZ NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS status (
+      driver TEXT PRIMARY KEY,
+      data JSONB NOT NULL,
+      updated_at TIMESTAMPTZ NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_locations_driver_time ON locations (driver, "timestamp");
+    CREATE INDEX IF NOT EXISTS idx_trips_driver ON trips (driver);
+  `);
+
+  // Semente inicial — só insere se as tabelas estiverem vazias (primeira vez).
+  // Depois disso, nunca mais mexe sozinho nesses dados.
+  const { rows: driverCount } = await pool.query('SELECT COUNT(*) FROM drivers');
+  if (Number(driverCount[0].count) === 0) {
+    await pool.query(`INSERT INTO drivers (name, password) VALUES ($1,$2),($3,$4)`,
+      ['João Silva', '1234', 'Carlos Souza', '1234']);
+  }
+  const { rows: truckCount } = await pool.query('SELECT COUNT(*) FROM trucks');
+  if (Number(truckCount[0].count) === 0) {
+    await pool.query(`INSERT INTO trucks (tag) VALUES ($1),($2),($3)`, ['SV7-001', 'SV7-002', 'SV7-003']);
+  }
+  const { rows: configCount } = await pool.query('SELECT COUNT(*) FROM config');
+  if (Number(configCount[0].count) === 0) {
+    await pool.query('INSERT INTO config (id) VALUES (1)');
+  }
+  console.log('Banco de dados pronto.');
 }
 
 /* ---------------- Tokens de admin (em memória) ---------------- */
 const adminTokens = new Set();
-
 function isAdminAuthed(req) {
   const auth = req.headers['authorization'] || '';
-  const token = auth.replace('Bearer ', '');
-  return adminTokens.has(token);
+  return adminTokens.has(auth.replace('Bearer ', ''));
 }
 
 /* ---------------- Utilitários HTTP ---------------- */
@@ -62,14 +99,11 @@ function sendJSON(res, status, data) {
   });
   res.end(body);
 }
-
 function readBody(req) {
   return new Promise((resolve) => {
     let raw = '';
-    req.on('data', (chunk) => (raw += chunk));
-    req.on('end', () => {
-      try { resolve(raw ? JSON.parse(raw) : {}); } catch { resolve({}); }
-    });
+    req.on('data', (c) => (raw += c));
+    req.on('end', () => { try { resolve(raw ? JSON.parse(raw) : {}); } catch { resolve({}); } });
   });
 }
 
@@ -78,10 +112,7 @@ const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host}`);
   const p = url.pathname;
   const method = req.method;
-
   if (method === 'OPTIONS') return sendJSON(res, 204, {});
-
-  const db = load();
 
   try {
     /* ---------- LOGIN ADMIN ---------- */
@@ -98,141 +129,154 @@ const server = http.createServer(async (req, res) => {
     /* ---------- LOGIN MOTORISTA ---------- */
     if (p === '/api/driver/login' && method === 'POST') {
       const { name, password } = await readBody(req);
-      const driver = db.drivers.find((d) => d.name === name && d.password === password);
-      if (!driver) return sendJSON(res, 401, { ok: false, error: 'Senha incorreta.' });
+      const { rows } = await pool.query('SELECT * FROM drivers WHERE name=$1 AND password=$2', [name, password]);
+      if (rows.length === 0) return sendJSON(res, 401, { ok: false, error: 'Senha incorreta.' });
       return sendJSON(res, 200, { ok: true });
     }
 
-    /* ---------- CONFIGURAÇÕES (leitura pública p/ o app, escrita só admin) ---------- */
+    /* ---------- CONFIGURAÇÕES ---------- */
     if (p === '/api/config' && method === 'GET') {
-      return sendJSON(res, 200, db.config);
+      const { rows } = await pool.query('SELECT speed_limit, tolerance_kmh, overspeed_seconds FROM config WHERE id=1');
+      const c = rows[0] || { speed_limit: 80, tolerance_kmh: 5, overspeed_seconds: 5 };
+      return sendJSON(res, 200, { speedLimit: c.speed_limit, toleranceKmh: c.tolerance_kmh, overspeedSeconds: c.overspeed_seconds });
     }
     if (p === '/api/config' && method === 'PUT') {
       if (!isAdminAuthed(req)) return sendJSON(res, 403, { error: 'Não autorizado.' });
       const body = await readBody(req);
-      db.config = { ...db.config, ...body };
-      save(db);
-      return sendJSON(res, 200, db.config);
+      await pool.query(
+        `UPDATE config SET
+           speed_limit = COALESCE($1, speed_limit),
+           tolerance_kmh = COALESCE($2, tolerance_kmh),
+           overspeed_seconds = COALESCE($3, overspeed_seconds)
+         WHERE id=1`,
+        [body.speedLimit ?? null, body.toleranceKmh ?? null, body.overspeedSeconds ?? null]
+      );
+      const { rows } = await pool.query('SELECT speed_limit, tolerance_kmh, overspeed_seconds FROM config WHERE id=1');
+      const c = rows[0];
+      return sendJSON(res, 200, { speedLimit: c.speed_limit, toleranceKmh: c.tolerance_kmh, overspeedSeconds: c.overspeed_seconds });
     }
 
     /* ---------- MOTORISTAS ---------- */
     if (p === '/api/motoristas' && method === 'GET') {
-      // lista pública sem senha (o app usa isso para popular o seletor de login)
-      return sendJSON(res, 200, db.drivers.map((d) => ({ name: d.name })));
+      const { rows } = await pool.query('SELECT name FROM drivers ORDER BY name');
+      return sendJSON(res, 200, rows);
     }
     if (p === '/api/motoristas' && method === 'POST') {
       if (!isAdminAuthed(req)) return sendJSON(res, 403, { error: 'Não autorizado.' });
       const { name, password } = await readBody(req);
       if (!name || !password) return sendJSON(res, 400, { error: 'Nome e senha são obrigatórios.' });
-      if (db.drivers.some((d) => d.name === name)) return sendJSON(res, 409, { error: 'Já existe um motorista com esse nome.' });
-      db.drivers.push({ name, password });
-      save(db);
+      try {
+        await pool.query('INSERT INTO drivers (name, password) VALUES ($1,$2)', [name, password]);
+      } catch (e) {
+        if (e.code === '23505') return sendJSON(res, 409, { error: 'Já existe um motorista com esse nome.' });
+        throw e;
+      }
       return sendJSON(res, 201, { ok: true });
     }
     if (p.startsWith('/api/motoristas/') && method === 'DELETE') {
       if (!isAdminAuthed(req)) return sendJSON(res, 403, { error: 'Não autorizado.' });
       const name = decodeURIComponent(p.split('/')[3]);
-      db.drivers = db.drivers.filter((d) => d.name !== name);
-      save(db);
+      await pool.query('DELETE FROM drivers WHERE name=$1', [name]);
       return sendJSON(res, 200, { ok: true });
     }
 
-    /* ---------- VEÍCULOS / TAGs ---------- */
+    /* ---------- VEÍCULOS ---------- */
     if (p === '/api/veiculos' && method === 'GET') {
-      return sendJSON(res, 200, db.trucks);
+      const { rows } = await pool.query('SELECT tag FROM trucks ORDER BY tag');
+      return sendJSON(res, 200, rows);
     }
     if (p === '/api/veiculos' && method === 'POST') {
       if (!isAdminAuthed(req)) return sendJSON(res, 403, { error: 'Não autorizado.' });
       const { tag } = await readBody(req);
       if (!tag) return sendJSON(res, 400, { error: 'TAG é obrigatória.' });
-      if (db.trucks.some((t) => t.tag === tag)) return sendJSON(res, 409, { error: 'TAG já cadastrada.' });
-      db.trucks.push({ tag });
-      save(db);
+      try {
+        await pool.query('INSERT INTO trucks (tag) VALUES ($1)', [tag]);
+      } catch (e) {
+        if (e.code === '23505') return sendJSON(res, 409, { error: 'TAG já cadastrada.' });
+        throw e;
+      }
       return sendJSON(res, 201, { ok: true });
     }
     if (p.startsWith('/api/veiculos/') && method === 'DELETE') {
       if (!isAdminAuthed(req)) return sendJSON(res, 403, { error: 'Não autorizado.' });
       const tag = decodeURIComponent(p.split('/')[3]);
-      db.trucks = db.trucks.filter((t) => t.tag !== tag);
-      save(db);
+      await pool.query('DELETE FROM trucks WHERE tag=$1', [tag]);
       return sendJSON(res, 200, { ok: true });
     }
 
-    /* ---------- VIAGENS (relatórios completos, enviados ao finalizar) ---------- */
+    /* ---------- VIAGENS ---------- */
     if (p === '/api/viagens' && method === 'POST') {
       const trip = await readBody(req);
       if (!trip.id || !trip.driver) return sendJSON(res, 400, { error: 'Viagem inválida.' });
-      const idx = db.trips.findIndex((t) => t.id === trip.id);
-      if (idx >= 0) db.trips[idx] = trip; else db.trips.push(trip);
-      save(db);
+      await pool.query(
+        `INSERT INTO trips (id, driver, tag, start_time, end_time, data)
+         VALUES ($1,$2,$3,$4,$5,$6)
+         ON CONFLICT (id) DO UPDATE SET tag=$3, start_time=$4, end_time=$5, data=$6`,
+        [trip.id, trip.driver, trip.tag || null, trip.startTime || null, trip.endTime || null, JSON.stringify(trip)]
+      );
       return sendJSON(res, 201, { ok: true });
     }
     if (p === '/api/viagens' && method === 'GET') {
-      let list = db.trips;
       const driver = url.searchParams.get('driver');
-      const date = url.searchParams.get('date'); // YYYY-MM-DD
-      // motorista comum só pode ver as próprias viagens
-      if (!isAdminAuthed(req)) {
-        if (!driver) return sendJSON(res, 403, { error: 'Informe o motorista.' });
-        list = list.filter((t) => t.driver === driver);
-      } else if (driver) {
-        list = list.filter((t) => t.driver === driver);
-      }
-      if (date) list = list.filter((t) => (t.startTime || '').slice(0, 10) === date);
-      return sendJSON(res, 200, list);
+      const date = url.searchParams.get('date');
+      if (!isAdminAuthed(req) && !driver) return sendJSON(res, 403, { error: 'Informe o motorista.' });
+      let query = 'SELECT data FROM trips WHERE 1=1';
+      const params = [];
+      if (driver) { params.push(driver); query += ` AND driver=$${params.length}`; }
+      if (date) { params.push(date); query += ` AND start_time::date = $${params.length}::date`; }
+      query += ' ORDER BY start_time';
+      const { rows } = await pool.query(query, params);
+      return sendJSON(res, 200, rows.map((r) => r.data));
     }
 
-    /* ---------- STATUS AO VIVO (evento atual, atualizado periodicamente pelo app) ---------- */
+    /* ---------- STATUS AO VIVO ---------- */
     if (p === '/api/status' && method === 'POST') {
       const s = await readBody(req);
       if (!s.driver) return sendJSON(res, 400, { error: 'Motorista é obrigatório.' });
-      db.status[s.driver] = { ...s, updatedAt: new Date().toISOString() };
-      save(db);
+      await pool.query(
+        `INSERT INTO status (driver, data, updated_at) VALUES ($1,$2,NOW())
+         ON CONFLICT (driver) DO UPDATE SET data=$2, updated_at=NOW()`,
+        [s.driver, JSON.stringify(s)]
+      );
       return sendJSON(res, 200, { ok: true });
     }
     if (p === '/api/status' && method === 'GET') {
       if (!isAdminAuthed(req)) return sendJSON(res, 403, { error: 'Não autorizado.' });
-      // considera "online" quem enviou status nos últimos 2 minutos
+      const { rows } = await pool.query('SELECT driver, data, updated_at FROM status');
       const now = Date.now();
-      const result = Object.entries(db.status).map(([driver, s]) => ({
-        driver, ...s,
-        online: now - new Date(s.updatedAt).getTime() < 120000,
+      const result = rows.map((r) => ({
+        driver: r.driver,
+        ...r.data,
+        online: now - new Date(r.updated_at).getTime() < 120000,
       }));
       return sendJSON(res, 200, result);
     }
 
-    /* ---------- LOCALIZAÇÃO (pontos de GPS em tempo real, para o mapa) ---------- */
+    /* ---------- LOCALIZAÇÃO ---------- */
     if (p === '/api/localizacao' && method === 'POST') {
       const loc = await readBody(req);
       if (!loc.driver) return sendJSON(res, 400, { error: 'Motorista é obrigatório.' });
-      db.locations.push(loc);
-      // mantém só os últimos 20.000 pontos para não crescer indefinidamente
-      if (db.locations.length > 20000) db.locations = db.locations.slice(-20000);
-      save(db);
+      await pool.query(
+        'INSERT INTO locations (driver, tag, lat, lng, speed, "timestamp") VALUES ($1,$2,$3,$4,$5,$6)',
+        [loc.driver, loc.tag || null, loc.lat || null, loc.lng || null, loc.speed || 0, loc.timestamp || new Date().toISOString()]
+      );
       return sendJSON(res, 201, { ok: true });
     }
     if (p === '/api/localizacao' && method === 'GET') {
       if (!isAdminAuthed(req)) return sendJSON(res, 403, { error: 'Não autorizado.' });
-      let list = db.locations;
       const driver = url.searchParams.get('driver');
-      const since = url.searchParams.get('since'); // ISO timestamp
-      const until = url.searchParams.get('until'); // ISO timestamp
-      if (driver) list = list.filter((l) => l.driver === driver);
-      if (since) list = list.filter((l) => l.timestamp >= since);
-      if (until) list = list.filter((l) => l.timestamp <= until);
-      return sendJSON(res, 200, list.slice(-8000));
-    }
-
-    /* ---------- Arquivos estáticos do painel admin (opcional, se hospedado junto) ---------- */
-    if (method === 'GET' && !p.startsWith('/api/')) {
-      const staticDir = path.join(__dirname, '..', 'admin');
-      let filePath = path.join(staticDir, p === '/' ? 'index.html' : p);
-      if (fs.existsSync(filePath) && fs.statSync(filePath).isFile()) {
-        const ext = path.extname(filePath);
-        const types = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css' };
-        res.writeHead(200, { 'Content-Type': types[ext] || 'text/plain' });
-        return fs.createReadStream(filePath).pipe(res);
-      }
+      const since = url.searchParams.get('since');
+      const until = url.searchParams.get('until');
+      let query = 'SELECT driver, tag, lat, lng, speed, "timestamp" FROM locations WHERE 1=1';
+      const params = [];
+      if (driver) { params.push(driver); query += ` AND driver=$${params.length}`; }
+      if (since) { params.push(since); query += ` AND "timestamp" >= $${params.length}`; }
+      if (until) { params.push(until); query += ` AND "timestamp" <= $${params.length}`; }
+      query += ' ORDER BY "timestamp"';
+      // Sem limite artificial — traz o registro COMPLETO do período pedido,
+      // independente de ter havido ocorrência de excesso de velocidade ou não.
+      const { rows } = await pool.query(query, params);
+      return sendJSON(res, 200, rows.map((r) => ({ ...r, timestamp: r.timestamp.toISOString() })));
     }
 
     sendJSON(res, 404, { error: 'Rota não encontrada.' });
@@ -242,4 +286,9 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-server.listen(PORT, () => console.log(`SV7 API rodando na porta ${PORT}`));
+initDB()
+  .then(() => server.listen(PORT, () => console.log(`SV7 API rodando na porta ${PORT} (com banco de dados permanente)`)))
+  .catch((err) => {
+    console.error('Falha ao iniciar o banco de dados:', err);
+    process.exit(1);
+  });
