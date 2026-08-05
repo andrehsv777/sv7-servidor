@@ -1,9 +1,12 @@
 {
   "name": "sv7-server",
   "version": "1.0.0",
-  "description": "API do sistema SV7 (sem dependências externas)",
+  "description": "API do sistema SV7 (com banco de dados PostgreSQL permanente)",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
+  },
+  "dependencies": {
+    "pg": "^8.13.1"
   }
 }
