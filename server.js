@@ -31,6 +31,7 @@ async function initDB() {
     CREATE TABLE IF NOT EXISTS trucks (
       tag TEXT PRIMARY KEY
     );
+    ALTER TABLE trucks ADD COLUMN IF NOT EXISTS placa TEXT;
     CREATE TABLE IF NOT EXISTS config (
       id INT PRIMARY KEY DEFAULT 1,
       speed_limit INT NOT NULL DEFAULT 80,
@@ -182,15 +183,15 @@ const server = http.createServer(async (req, res) => {
 
     /* ---------- VEÍCULOS ---------- */
     if (p === '/api/veiculos' && method === 'GET') {
-      const { rows } = await pool.query('SELECT tag FROM trucks ORDER BY tag');
+      const { rows } = await pool.query('SELECT tag, placa FROM trucks ORDER BY tag');
       return sendJSON(res, 200, rows);
     }
     if (p === '/api/veiculos' && method === 'POST') {
       if (!isAdminAuthed(req)) return sendJSON(res, 403, { error: 'Não autorizado.' });
-      const { tag } = await readBody(req);
+      const { tag, placa } = await readBody(req);
       if (!tag) return sendJSON(res, 400, { error: 'TAG é obrigatória.' });
       try {
-        await pool.query('INSERT INTO trucks (tag) VALUES ($1)', [tag]);
+        await pool.query('INSERT INTO trucks (tag, placa) VALUES ($1,$2)', [tag, placa || null]);
       } catch (e) {
         if (e.code === '23505') return sendJSON(res, 409, { error: 'TAG já cadastrada.' });
         throw e;
