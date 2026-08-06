@@ -276,11 +276,13 @@ const server = http.createServer(async (req, res) => {
     if (p === '/api/localizacao' && method === 'GET') {
       if (!isAdminAuthed(req)) return sendJSON(res, 403, { error: 'Não autorizado.' });
       const driver = url.searchParams.get('driver');
+      const tag = url.searchParams.get('tag');
       const since = url.searchParams.get('since');
       const until = url.searchParams.get('until');
       let query = 'SELECT driver, tag, lat, lng, speed, "timestamp" FROM locations WHERE 1=1';
       const params = [];
       if (driver) { params.push(driver); query += ` AND driver=$${params.length}`; }
+      if (tag) { params.push(tag); query += ` AND tag=$${params.length}`; }
       if (since) { params.push(since); query += ` AND "timestamp" >= $${params.length}`; }
       if (until) { params.push(until); query += ` AND "timestamp" <= $${params.length}`; }
       query += ' ORDER BY "timestamp"';
