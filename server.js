@@ -219,11 +219,15 @@ const server = http.createServer(async (req, res) => {
     if (p === '/api/viagens' && method === 'GET') {
       const driver = url.searchParams.get('driver');
       const date = url.searchParams.get('date');
+      const since = url.searchParams.get('since');
+      const until = url.searchParams.get('until');
       if (!isAdminAuthed(req) && !driver) return sendJSON(res, 403, { error: 'Informe o motorista.' });
       let query = 'SELECT data FROM trips WHERE 1=1';
       const params = [];
       if (driver) { params.push(driver); query += ` AND driver=$${params.length}`; }
       if (date) { params.push(date); query += ` AND start_time::date = $${params.length}::date`; }
+      if (since) { params.push(since); query += ` AND start_time >= $${params.length}`; }
+      if (until) { params.push(until); query += ` AND start_time <= $${params.length}`; }
       query += ' ORDER BY start_time';
       const { rows } = await pool.query(query, params);
       return sendJSON(res, 200, rows.map((r) => r.data));
