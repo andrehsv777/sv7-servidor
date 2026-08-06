@@ -233,6 +233,12 @@ const server = http.createServer(async (req, res) => {
       const { rows } = await pool.query(query, params);
       return sendJSON(res, 200, rows.map((r) => r.data));
     }
+    if (p.startsWith('/api/viagens/') && method === 'DELETE') {
+      if (!isAdminAuthed(req)) return sendJSON(res, 403, { error: 'Não autorizado.' });
+      const id = decodeURIComponent(p.split('/')[3]);
+      await pool.query('DELETE FROM trips WHERE id=$1', [id]);
+      return sendJSON(res, 200, { ok: true });
+    }
 
     /* ---------- STATUS AO VIVO ---------- */
     if (p === '/api/status' && method === 'POST') {
