@@ -60,6 +60,19 @@ async function initDB() {
       data JSONB NOT NULL,
       updated_at TIMESTAMPTZ NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS places (
+      id SERIAL PRIMARY KEY,
+      name TEXT NOT NULL,
+      lat DOUBLE PRECISION NOT NULL,
+      lng DOUBLE PRECISION NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS routes (
+      id SERIAL PRIMARY KEY,
+      name TEXT NOT NULL,
+      points JSONB NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
     CREATE INDEX IF NOT EXISTS idx_locations_driver_time ON locations (driver, "timestamp");
     CREATE INDEX IF NOT EXISTS idx_trips_driver ON trips (driver);
   `);
@@ -290,6 +303,52 @@ const server = http.createServer(async (req, res) => {
       // independente de ter havido ocorrência de excesso de velocidade ou não.
       const { rows } = await pool.query(query, params);
       return sendJSON(res, 200, rows.map((r) => ({ ...r, timestamp: r.timestamp.toISOString() })));
+    }
+
+    /* ---------- LOCAIS SALVOS (alfinetes com nome, aparecem em todos os mapas) ---------- */
+    if (p === '/api/locais' && method === 'GET') {
+      const { rows } = await pool.query('SELECT id, name, lat, lng FROM places ORDER BY id');
+      return sendJSON(res, 200, rows);
+    }
+    if (p === '/api/locais' && method === 'POST') {
+      if (!isAdminAuthed(req)) return sendJSON(res, 403, { error: 'Não autorizado.' });
+      const { name, lat, lng } = await readBody(req);
+      if (!name || lat == null || lng == null) return sendJSON(res, 400, { error: 'Nome e coordenadas são obrigatórios.' });
+      const { rows } = await pool.query('INSERT INTO places (name, lat, lng) VALUES ($1,$2,$3) RETURNING id, name, lat, lng', [name, lat, lng]);
+      return sendJSON(res, 201, rows[0]);
+    }
+    if (p.startsWith('/api/locais/') && method === 'PUT') {
+      if (!isAdminAuthed(req)) return sendJSON(res, 403, { error: 'Não autorizado.' });
+      const id = Number(p.split('/')[3]);
+      const { name } = await readBody(req);
+      if (!name) return sendJSON(res, 400, { error: 'Nome é obrigatório.' });
+      await pool.query('UPDATE places SET name=$1 WHERE id=$2', [name, id]);
+      return sendJSON(res, 200, { ok: true });
+    }
+    if (p.startsWith('/api/locais/') && method === 'DELETE') {
+      if (!isAdminAuthed(req)) return sendJSON(res, 403, { error: 'Não autorizado.' });
+      const id = Number(p.split('/')[3]);
+      await pool.query('DELETE FROM places WHERE id=$1', [id]);
+      return sendJSON(res, 200, { ok: true });
+    }
+
+    /* ---------- ROTAS DESENHADAS (trajeto real da estrada, aparecem em todos os mapas) ---------- */
+    if (p === '/api/rotas' && method === 'GET') {
+      const { rows } = await pool.query('SELECT id, name, points FROM routes ORDER BY id');
+      return sendJSON(res, 200, rows);
+    }
+    if (p === '/api/rotas' && method === 'POST') {
+      if (!isAdminAuthed(req)) return sendJSON(res, 403, { error: 'Não autorizado.' });
+      const { name, points } = await readBody(req);
+      if (!name || !Array.isArray(points) || points.length < 2) return sendJSON(res, 400, { error: 'Nome e ao menos 2 pontos são obrigatórios.' });
+      const { rows } = await pool.query('INSERT INTO routes (name, points) VALUES ($1,$2) RETURNING id, name, points', [name, JSON.stringify(points)]);
+      return sendJSON(res, 201, rows[0]);
+    }
+    if (p.startsWith('/api/rotas/') && method === 'DELETE') {
+      if (!isAdminAuthed(req)) return sendJSON(res, 403, { error: 'Não autorizado.' });
+      const id = Number(p.split('/')[3]);
+      await pool.query('DELETE FROM routes WHERE id=$1', [id]);
+      return sendJSON(res, 200, { ok: true });
     }
 
     sendJSON(res, 404, { error: 'Rota não encontrada.' });
