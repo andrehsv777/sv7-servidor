@@ -347,6 +347,19 @@ const server = http.createServer(async (req, res) => {
       const r = rows[0];
       return sendJSON(res, 201, { id: r.id, name: r.name, points: r.points, speedLimit: r.speed_limit });
     }
+    if (p.startsWith('/api/rotas/') && method === 'PUT') {
+      if (!isAdminAuthed(req)) return sendJSON(res, 403, { error: 'Não autorizado.' });
+      const id = Number(p.split('/')[3]);
+      const body = await readBody(req);
+      const setName = body.name != null ? body.name : null;
+      const hasSpeedLimit = Object.prototype.hasOwnProperty.call(body, 'speedLimit');
+      if (hasSpeedLimit) {
+        await pool.query('UPDATE routes SET name = COALESCE($1, name), speed_limit = $2 WHERE id=$3', [setName, body.speedLimit, id]);
+      } else {
+        await pool.query('UPDATE routes SET name = COALESCE($1, name) WHERE id=$2', [setName, id]);
+      }
+      return sendJSON(res, 200, { ok: true });
+    }
     if (p.startsWith('/api/rotas/') && method === 'DELETE') {
       if (!isAdminAuthed(req)) return sendJSON(res, 403, { error: 'Não autorizado.' });
       const id = Number(p.split('/')[3]);
