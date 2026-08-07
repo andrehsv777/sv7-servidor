@@ -76,6 +76,7 @@ async function initDB() {
     );
     ALTER TABLE routes ADD COLUMN IF NOT EXISTS speed_limit INT;
     CREATE INDEX IF NOT EXISTS idx_locations_driver_time ON locations (driver, "timestamp");
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_locations_unique ON locations (driver, "timestamp");
     CREATE INDEX IF NOT EXISTS idx_trips_driver ON trips (driver);
   `);
 
@@ -230,6 +231,29 @@ const server = http.createServer(async (req, res) => {
          ON CONFLICT (id) DO UPDATE SET tag=$3, start_time=$4, end_time=$5, data=$6`,
         [trip.id, trip.driver, trip.tag || null, trip.startTime || null, trip.endTime || null, JSON.stringify(trip)]
       );
+
+      // Alimenta também o registro do tacógrafo (tabela locations) com TODOS
+      // os pontos de GPS da viagem — inclusive os que foram gravados offline.
+      // Isso garante que o gráfico de velocidade nunca fique com buracos,
+      // mesmo que o celular tenha ficado sem sinal durante parte do trajeto.
+      // ON CONFLICT evita duplicar pontos já enviados em syncs anteriores.
+      if (Array.isArray(trip.gpsPoints) && trip.gpsPoints.length > 0) {
+        const BATCH = 500;
+        for (let i = 0; i < trip.gpsPoints.length; i += BATCH) {
+          const chunk = trip.gpsPoints.slice(i, i + BATCH);
+          const values = [];
+          const placeholders = chunk.map((gp, idx) => {
+            const b = idx * 6;
+            values.push(trip.driver, trip.tag || null, gp.lat ?? null, gp.lng ?? null, gp.speed ?? 0, gp.timestamp);
+            return `($${b + 1},$${b + 2},$${b + 3},$${b + 4},$${b + 5},$${b + 6})`;
+          });
+          await pool.query(
+            `INSERT INTO locations (driver, tag, lat, lng, speed, "timestamp") VALUES ${placeholders.join(',')} ON CONFLICT (driver, "timestamp") DO NOTHING`,
+            values
+          );
+        }
+      }
+
       return sendJSON(res, 201, { ok: true });
     }
     if (p === '/api/viagens' && method === 'GET') {
