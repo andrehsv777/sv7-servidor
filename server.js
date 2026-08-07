@@ -67,12 +67,14 @@ async function initDB() {
       lng DOUBLE PRECISION NOT NULL,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
+    ALTER TABLE places ADD COLUMN IF NOT EXISTS type TEXT DEFAULT 'local';
     CREATE TABLE IF NOT EXISTS routes (
       id SERIAL PRIMARY KEY,
       name TEXT NOT NULL,
       points JSONB NOT NULL,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
+    ALTER TABLE routes ADD COLUMN IF NOT EXISTS speed_limit INT;
     CREATE INDEX IF NOT EXISTS idx_locations_driver_time ON locations (driver, "timestamp");
     CREATE INDEX IF NOT EXISTS idx_trips_driver ON trips (driver);
   `);
@@ -307,14 +309,14 @@ const server = http.createServer(async (req, res) => {
 
     /* ---------- LOCAIS SALVOS (alfinetes com nome, aparecem em todos os mapas) ---------- */
     if (p === '/api/locais' && method === 'GET') {
-      const { rows } = await pool.query('SELECT id, name, lat, lng FROM places ORDER BY id');
+      const { rows } = await pool.query('SELECT id, name, lat, lng, type FROM places ORDER BY id');
       return sendJSON(res, 200, rows);
     }
     if (p === '/api/locais' && method === 'POST') {
       if (!isAdminAuthed(req)) return sendJSON(res, 403, { error: 'Não autorizado.' });
-      const { name, lat, lng } = await readBody(req);
+      const { name, lat, lng, type } = await readBody(req);
       if (!name || lat == null || lng == null) return sendJSON(res, 400, { error: 'Nome e coordenadas são obrigatórios.' });
-      const { rows } = await pool.query('INSERT INTO places (name, lat, lng) VALUES ($1,$2,$3) RETURNING id, name, lat, lng', [name, lat, lng]);
+      const { rows } = await pool.query('INSERT INTO places (name, lat, lng, type) VALUES ($1,$2,$3,$4) RETURNING id, name, lat, lng, type', [name, lat, lng, type || 'local']);
       return sendJSON(res, 201, rows[0]);
     }
     if (p.startsWith('/api/locais/') && method === 'PUT') {
@@ -332,17 +334,18 @@ const server = http.createServer(async (req, res) => {
       return sendJSON(res, 200, { ok: true });
     }
 
-    /* ---------- ROTAS DESENHADAS (trajeto real da estrada, aparecem em todos os mapas) ---------- */
+    /* ---------- ROTAS DESENHADAS (trajeto real da estrada, com limite de velocidade próprio) ---------- */
     if (p === '/api/rotas' && method === 'GET') {
-      const { rows } = await pool.query('SELECT id, name, points FROM routes ORDER BY id');
-      return sendJSON(res, 200, rows);
+      const { rows } = await pool.query('SELECT id, name, points, speed_limit FROM routes ORDER BY id');
+      return sendJSON(res, 200, rows.map(r => ({ id: r.id, name: r.name, points: r.points, speedLimit: r.speed_limit })));
     }
     if (p === '/api/rotas' && method === 'POST') {
       if (!isAdminAuthed(req)) return sendJSON(res, 403, { error: 'Não autorizado.' });
-      const { name, points } = await readBody(req);
+      const { name, points, speedLimit } = await readBody(req);
       if (!name || !Array.isArray(points) || points.length < 2) return sendJSON(res, 400, { error: 'Nome e ao menos 2 pontos são obrigatórios.' });
-      const { rows } = await pool.query('INSERT INTO routes (name, points) VALUES ($1,$2) RETURNING id, name, points', [name, JSON.stringify(points)]);
-      return sendJSON(res, 201, rows[0]);
+      const { rows } = await pool.query('INSERT INTO routes (name, points, speed_limit) VALUES ($1,$2,$3) RETURNING id, name, points, speed_limit', [name, JSON.stringify(points), speedLimit || null]);
+      const r = rows[0];
+      return sendJSON(res, 201, { id: r.id, name: r.name, points: r.points, speedLimit: r.speed_limit });
     }
     if (p.startsWith('/api/rotas/') && method === 'DELETE') {
       if (!isAdminAuthed(req)) return sendJSON(res, 403, { error: 'Não autorizado.' });
