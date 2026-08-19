@@ -60,6 +60,13 @@ async function initDB() {
       data JSONB NOT NULL,
       updated_at TIMESTAMPTZ NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS disposals (
+      id TEXT PRIMARY KEY,
+      driver TEXT NOT NULL,
+      motivo TEXT,
+      start_time TIMESTAMPTZ,
+      end_time TIMESTAMPTZ
+    );
     CREATE TABLE IF NOT EXISTS places (
       id SERIAL PRIMARY KEY,
       name TEXT NOT NULL,
@@ -329,6 +336,39 @@ const server = http.createServer(async (req, res) => {
       // independente de ter havido ocorrência de excesso de velocidade ou não.
       const { rows } = await pool.query(query, params);
       return sendJSON(res, 200, rows.map((r) => ({ ...r, timestamp: r.timestamp.toISOString() })));
+    }
+
+    /* ---------- MOTORISTA À DISPOSIÇÃO DA EMPRESA (sem veículo, com motivo) ---------- */
+    if (p === '/api/disposicoes' && method === 'POST') {
+      const d = await readBody(req);
+      if (!d.id || !d.driver) return sendJSON(res, 400, { error: 'Dados inválidos.' });
+      await pool.query(
+        `INSERT INTO disposals (id, driver, motivo, start_time, end_time)
+         VALUES ($1,$2,$3,$4,$5)
+         ON CONFLICT (id) DO UPDATE SET motivo=$3, start_time=$4, end_time=$5`,
+        [d.id, d.driver, d.motivo || null, d.startTime || null, d.endTime || null]
+      );
+      return sendJSON(res, 201, { ok: true });
+    }
+    if (p === '/api/disposicoes' && method === 'GET') {
+      const driver = url.searchParams.get('driver');
+      const since = url.searchParams.get('since');
+      const until = url.searchParams.get('until');
+      if (!isAdminAuthed(req) && !driver) return sendJSON(res, 403, { error: 'Informe o motorista.' });
+      let query = 'SELECT id, driver, motivo, start_time, end_time FROM disposals WHERE 1=1';
+      const params = [];
+      if (driver) { params.push(driver); query += ` AND driver=$${params.length}`; }
+      if (since) { params.push(since); query += ` AND start_time >= $${params.length}`; }
+      if (until) { params.push(until); query += ` AND start_time <= $${params.length}`; }
+      query += ' ORDER BY start_time DESC';
+      const { rows } = await pool.query(query, params);
+      return sendJSON(res, 200, rows.map(r => ({ id: r.id, driver: r.driver, motivo: r.motivo, startTime: r.start_time, endTime: r.end_time })));
+    }
+    if (p.startsWith('/api/disposicoes/') && method === 'DELETE') {
+      if (!isAdminAuthed(req)) return sendJSON(res, 403, { error: 'Não autorizado.' });
+      const id = decodeURIComponent(p.split('/')[3]);
+      await pool.query('DELETE FROM disposals WHERE id=$1', [id]);
+      return sendJSON(res, 200, { ok: true });
     }
 
     /* ---------- LOCAIS SALVOS (alfinetes com nome, aparecem em todos os mapas) ---------- */
