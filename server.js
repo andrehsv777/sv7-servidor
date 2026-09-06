@@ -8,6 +8,8 @@
 const http = require('http');
 const crypto = require('crypto');
 const { Pool } = require('pg');
+let nodemailer;
+try { nodemailer = require('nodemailer'); } catch (_) { nodemailer = null; }
 
 const PORT = process.env.PORT || 3000;
 const ADMIN_USER = 'ADM01';
@@ -82,6 +84,22 @@ async function initDB() {
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
     ALTER TABLE routes ADD COLUMN IF NOT EXISTS speed_limit INT;
+    CREATE TABLE IF NOT EXISTS overtime_requests (
+      id TEXT PRIMARY KEY,
+      driver TEXT NOT NULL,
+      date DATE NOT NULL,
+      start_time TEXT NOT NULL,
+      end_time TEXT NOT NULL,
+      motivo TEXT,
+      photo TEXT,
+      status TEXT NOT NULL DEFAULT 'aguardando',
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      reviewed_at TIMESTAMPTZ
+    );
+    CREATE TABLE IF NOT EXISTS overtime_emails (
+      email TEXT PRIMARY KEY
+    );
+    CREATE INDEX IF NOT EXISTS idx_overtime_driver ON overtime_requests (driver);
     CREATE INDEX IF NOT EXISTS idx_locations_driver_time ON locations (driver, "timestamp");
     CREATE UNIQUE INDEX IF NOT EXISTS idx_locations_unique ON locations (driver, "timestamp");
     CREATE INDEX IF NOT EXISTS idx_trips_driver ON trips (driver);
@@ -103,6 +121,47 @@ async function initDB() {
     await pool.query('INSERT INTO config (id) VALUES (1)');
   }
   console.log('Banco de dados pronto.');
+}
+
+/* ---------------- E-mail de Hora Extra (SMTP configurado via variáveis de ambiente) ----------------
+   Configure no serviço de hospedagem (Render/Railway):
+   SMTP_HOST, SMTP_PORT, SMTP_SECURE ("true"/"false"), SMTP_USER, SMTP_PASS, SMTP_FROM
+   Se não configurado, o registro é salvo normalmente mas o e-mail não é enviado (aviso no log). */
+async function sendOvertimeEmail(o) {
+  if (!nodemailer || !process.env.SMTP_HOST) {
+    console.warn('SMTP não configurado — e-mail de hora extra não enviado (registro salvo normalmente).');
+    return;
+  }
+  const { rows } = await pool.query('SELECT email FROM overtime_emails ORDER BY email');
+  const emails = rows.map((r) => r.email);
+  if (emails.length === 0) {
+    console.warn('Nenhum e-mail cadastrado para receber notificações de hora extra.');
+    return;
+  }
+  const transporter = nodemailer.createTransport({
+    host: process.env.SMTP_HOST,
+    port: Number(process.env.SMTP_PORT || 587),
+    secure: process.env.SMTP_SECURE === 'true',
+    auth: process.env.SMTP_USER ? { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS } : undefined,
+  });
+  const attachments = [];
+  if (o.photo && typeof o.photo === 'string' && o.photo.startsWith('data:')) {
+    const match = o.photo.match(/^data:(.+);base64,(.+)$/);
+    if (match) attachments.push({ filename: 'comprovante.jpg', content: Buffer.from(match[2], 'base64'), contentType: match[1] });
+  }
+  await transporter.sendMail({
+    from: process.env.SMTP_FROM || process.env.SMTP_USER,
+    to: emails.join(','),
+    subject: `Hora extra para aprovação — ${o.driver} (${o.date})`,
+    html: `
+      <p><b>Motorista:</b> ${o.driver}</p>
+      <p><b>Data:</b> ${o.date}</p>
+      <p><b>Horário:</b> ${o.startTime} às ${o.endTime}</p>
+      <p><b>Motivo:</b> ${o.motivo || '(não informado)'}</p>
+      <p>Acesse o painel administrativo, aba <b>Horas Extras</b>, para aprovar ou reprovar este pedido.</p>
+    `,
+    attachments,
+  });
 }
 
 /* ---------------- Tokens de admin (em memória) ---------------- */
@@ -428,6 +487,85 @@ const server = http.createServer(async (req, res) => {
       if (!isAdminAuthed(req)) return sendJSON(res, 403, { error: 'Não autorizado.' });
       const id = Number(p.split('/')[3]);
       await pool.query('DELETE FROM routes WHERE id=$1', [id]);
+      return sendJSON(res, 200, { ok: true });
+    }
+
+    /* ---------- HORAS EXTRAS ---------- */
+    /* E-mails cadastrados para receber notificação de novas horas extras (admin) */
+    if (p === '/api/horas-extras/emails' && method === 'GET') {
+      if (!isAdminAuthed(req)) return sendJSON(res, 403, { error: 'Não autorizado.' });
+      const { rows } = await pool.query('SELECT email FROM overtime_emails ORDER BY email');
+      return sendJSON(res, 200, rows.map((r) => r.email));
+    }
+    if (p === '/api/horas-extras/emails' && method === 'POST') {
+      if (!isAdminAuthed(req)) return sendJSON(res, 403, { error: 'Não autorizado.' });
+      const { email } = await readBody(req);
+      if (!email) return sendJSON(res, 400, { error: 'E-mail é obrigatório.' });
+      try {
+        await pool.query('INSERT INTO overtime_emails (email) VALUES ($1)', [String(email).trim().toLowerCase()]);
+      } catch (e) {
+        if (e.code === '23505') return sendJSON(res, 409, { error: 'E-mail já cadastrado.' });
+        throw e;
+      }
+      return sendJSON(res, 201, { ok: true });
+    }
+    if (p.startsWith('/api/horas-extras/emails/') && method === 'DELETE') {
+      if (!isAdminAuthed(req)) return sendJSON(res, 403, { error: 'Não autorizado.' });
+      const email = decodeURIComponent(p.split('/')[4]);
+      await pool.query('DELETE FROM overtime_emails WHERE email=$1', [email]);
+      return sendJSON(res, 200, { ok: true });
+    }
+
+    /* Motorista registra uma hora extra (data, horário, motivo e foto) */
+    if (p === '/api/horas-extras' && method === 'POST') {
+      const o = await readBody(req);
+      if (!o.id || !o.driver || !o.date || !o.startTime || !o.endTime) {
+        return sendJSON(res, 400, { error: 'Dados incompletos.' });
+      }
+      await pool.query(
+        `INSERT INTO overtime_requests (id, driver, date, start_time, end_time, motivo, photo, status)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,'aguardando')
+         ON CONFLICT (id) DO NOTHING`,
+        [o.id, o.driver, o.date, o.startTime, o.endTime, o.motivo || null, o.photo || null]
+      );
+      // Envia o e-mail de notificação sem travar a resposta ao app do motorista
+      // caso o SMTP esteja lento ou fora do ar — o registro já foi salvo.
+      sendOvertimeEmail(o).catch((err) => console.error('Falha ao enviar e-mail de hora extra:', err.message));
+      return sendJSON(res, 201, { ok: true });
+    }
+    /* Lista horas extras — motorista informando o próprio nome (para ver status),
+       ou admin (todas, com filtro opcional por motorista/status) */
+    if (p === '/api/horas-extras' && method === 'GET') {
+      const driver = url.searchParams.get('driver');
+      const status = url.searchParams.get('status');
+      if (!isAdminAuthed(req) && !driver) return sendJSON(res, 403, { error: 'Informe o motorista.' });
+      let query = 'SELECT id, driver, date, start_time, end_time, motivo, photo, status, created_at, reviewed_at FROM overtime_requests WHERE 1=1';
+      const params = [];
+      if (driver) { params.push(driver); query += ` AND driver=$${params.length}`; }
+      if (status) { params.push(status); query += ` AND status=$${params.length}`; }
+      query += ' ORDER BY created_at DESC';
+      const { rows } = await pool.query(query, params);
+      return sendJSON(res, 200, rows.map((r) => ({
+        id: r.id, driver: r.driver, date: r.date.toISOString().slice(0, 10),
+        startTime: r.start_time, endTime: r.end_time, motivo: r.motivo, photo: r.photo,
+        status: r.status, createdAt: r.created_at, reviewedAt: r.reviewed_at,
+      })));
+    }
+    /* Admin aprova/reprova (ou corrige) um pedido de hora extra */
+    if (p.startsWith('/api/horas-extras/') && method === 'PUT') {
+      if (!isAdminAuthed(req)) return sendJSON(res, 403, { error: 'Não autorizado.' });
+      const id = decodeURIComponent(p.split('/')[3]);
+      const { status } = await readBody(req);
+      if (!['aguardando', 'aprovado', 'reprovado'].includes(status)) {
+        return sendJSON(res, 400, { error: 'Status inválido.' });
+      }
+      await pool.query('UPDATE overtime_requests SET status=$1, reviewed_at=NOW() WHERE id=$2', [status, id]);
+      return sendJSON(res, 200, { ok: true });
+    }
+    if (p.startsWith('/api/horas-extras/') && method === 'DELETE') {
+      if (!isAdminAuthed(req)) return sendJSON(res, 403, { error: 'Não autorizado.' });
+      const id = decodeURIComponent(p.split('/')[3]);
+      await pool.query('DELETE FROM overtime_requests WHERE id=$1', [id]);
       return sendJSON(res, 200, { ok: true });
     }
 
